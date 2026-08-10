@@ -4,6 +4,7 @@ Provides Claude with grounded access to Indonesian legislation through 6 tools:
 - search_laws: Full-text search across Indonesian legal provisions
 - search_laws_semantic: Hybrid (semantic + FTS) search for natural-language questions
 - get_pasal: Get exact text of a specific article
+- get_lampiran: Get the annex (lampiran) text, all chapters or one
 - get_law_status: Check if a law is still in force
 - get_law_context: Get a law's structure, outline, and opening text (for summaries)
 - list_laws: Browse available regulations
@@ -209,6 +210,7 @@ class TTLCache:
 
 
 _pasal_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
+_section_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
 _status_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
 _context_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
 _law_count_cache = TTLCache(ttl_seconds=300, maxsize=10)
@@ -245,6 +247,7 @@ _rate_limiters = {
     "search_laws": RateLimiter(30),
     "search_laws_semantic": RateLimiter(30),
     "get_pasal": RateLimiter(60),
+    "get_lampiran": RateLimiter(60),
     "get_law_status": RateLimiter(60),
     "get_law_context": RateLimiter(60),
     "list_laws": RateLimiter(30),
@@ -335,6 +338,27 @@ def _pasal_alias(number: str) -> str | None:
         if num.upper() == roman:
             return arabic
     return None
+
+
+def _is_lampiran_path(path: Any) -> bool:
+    """True when a node lives under a lampiran (annex) container.
+
+    Annex chapter nodes carry an ltree path prefixed with the lampiran
+    segment (e.g. "lampiran_.bab_I"), while main-body chapters use
+    "bab_I". Any path segment starting with "lampiran" counts, so deeper
+    nesting inside an annex is also recognized.
+    """
+    if not path:
+        return False
+    return any(str(seg).startswith("lampiran") for seg in str(path).split("."))
+
+
+def _shorten_heading(text: str, limit: int = 120) -> str:
+    """Collapse whitespace and truncate long OCR headings for outline entries."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
 
 
 def _get_intro_snippet(work_id: int, max_chars: int = 600) -> str:
@@ -865,20 +889,26 @@ def get_law_context(
             nt = row["node_type"]
             counts[nt] = counts.get(nt, 0) + 1
 
-        bab_result = sb.table("document_nodes").select("number, heading").match({
+        bab_result = sb.table("document_nodes").select(
+            "number, heading, path"
+        ).match({
             "work_id": work_id,
             "node_type": "bab",
-        }).order("sort_order").limit(30).execute()
+        }).order("sort_order").limit(60).execute()
 
         outline_top: list[str] = []
+        outline_lampiran: list[str] = []
         for b in bab_result.data or []:
             num = (b.get("number") or "").strip()
             head = re.sub(r"\s+", " ", (b.get("heading") or "")).strip()
             label = f"BAB {num}" if num else "BAB"
+            line = label
             if head and head.upper() != label:
-                outline_top.append(f"{label} — {head}")
+                line = f"{label} — {_shorten_heading(head)}"
+            if _is_lampiran_path(b.get("path")):
+                outline_lampiran.append(line)
             else:
-                outline_top.append(label)
+                outline_top.append(line)
 
         outline_limit = 30 if detail == "outline" else 12
         result = _with_disclaimer({
@@ -893,6 +923,7 @@ def get_law_context(
                 "has_lampiran": counts.get("lampiran", 0) > 0,
             },
             "outline_top": outline_top[:outline_limit],
+            "outline_lampiran": outline_lampiran[:outline_limit],
             "intro_snippet": _get_intro_snippet(work_id),
             "detail": detail,
         })
@@ -901,6 +932,107 @@ def get_law_context(
     except Exception as e:
         logger.error("get_law_context failed: %s", e)
         return _with_disclaimer({"error": "Failed to retrieve law context. Please try again later."})
+
+
+@mcp.tool
+def get_lampiran(
+    law_type: str,
+    law_number: str,
+    year: int,
+    bab_number: str = "",
+) -> dict:
+    """Get the annex (lampiran) of an Indonesian regulation, one chapter or all of it.
+
+    USE WHEN: The user asks to read the lampiran of a law, or a specific chapter
+    inside it (e.g. "isi lampiran", "lampiran bab I"). Annex chapters are stored
+    separately from the main body; this tool returns their text.
+
+    Args:
+        law_type: Regulation type code, e.g., "UU", "PP", "PERPRES"
+        law_number: The number of the law, e.g., "59"
+        year: Year the law was enacted, e.g., 2024
+        bab_number: Optional annex chapter number (Roman or Arabic, e.g. "I" or
+            "1"). Empty returns every annex chapter.
+    """
+    rate_err = _check_rate_limit("get_lampiran")
+    if rate_err:
+        return rate_err
+
+    req_bab = (bab_number or "").strip().upper()
+    cache_key = f"{law_type.upper()}:{law_number}:{year}:lampiran:{req_bab}"
+    cached = _section_cache.get(cache_key)
+    if cached is not None:
+        logger.info("get_lampiran cache hit: %s", cache_key)
+        return cached
+
+    t0 = time.time()
+    logger.info("get_lampiran called: %s %s/%d bab %r", law_type, law_number, year, req_bab)
+
+    try:
+        work = _find_work(law_type, law_number, year)
+        if not work:
+            _ensure_reg_types()
+            if not _reg_types.get(law_type.upper()):
+                return _with_disclaimer({"error": f"Unknown regulation type: {law_type}"})
+            return _with_disclaimer({
+                "error": _no_results_message(f"'{law_type} {law_number}/{year}'"),
+            })
+
+        lampiran_result = sb.table("document_nodes").select("id").match({
+            "work_id": work["id"],
+            "node_type": "lampiran",
+        }).execute()
+        lampiran_ids = [row["id"] for row in (lampiran_result.data or [])]
+        if not lampiran_ids:
+            return _with_disclaimer({
+                "error": f"Tidak ada lampiran pada {law_type} {law_number}/{year}",
+                "suggestion": "Gunakan get_law_context untuk memeriksa struktur peraturan.",
+            })
+
+        query = sb.table("document_nodes").select(
+            "node_type, number, heading, content_text"
+        ).in_("parent_id", lampiran_ids)
+        if req_bab:
+            query = query.eq("number", req_bab)
+        nodes = (query.order("sort_order").limit(40).execute().data) or []
+
+        if req_bab and not nodes:
+            return _with_disclaimer({
+                "error": f"Bab {req_bab} tidak ditemukan pada lampiran {law_type} {law_number}/{year}",
+                "suggestion": "Gunakan get_law_context untuk melihat bab yang tersedia.",
+            })
+
+        sections: list[dict] = []
+        total_chars = 0
+        truncated = False
+        for n in nodes:
+            text = re.sub(r"\s+", " ", n.get("content_text") or "").strip()
+            if len(text) > 4000:
+                text = text[:4000].rstrip() + "\n\n[...truncated...]"
+                truncated = True
+            sections.append({
+                "kind": n.get("node_type") or "lampiran",
+                "number": n.get("number") or "",
+                "heading": re.sub(r"\s+", " ", (n.get("heading") or "")).strip(),
+                "content_text": text,
+                "content_chars": len(text),
+            })
+            total_chars += len(text)
+
+        logger.info("get_lampiran: found %d section(s) (%.0fms)", len(sections), (time.time() - t0) * 1000)
+        result = _with_disclaimer({
+            "law_title": work["title_id"],
+            "frbr_uri": work["frbr_uri"],
+            "has_lampiran": True,
+            "sections": sections,
+            "total_chars": total_chars,
+            "truncated": truncated,
+        })
+        _section_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        logger.error("get_lampiran failed: %s", e)
+        return _with_disclaimer({"error": "Failed to retrieve lampiran. Please try again later."})
 
 
 @mcp.tool

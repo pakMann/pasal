@@ -15,6 +15,7 @@ with patch("supabase.create_client", return_value=MagicMock()):
 # @mcp.tool wraps functions in FunctionTool; access the raw callables via .fn
 search_laws = server.search_laws.fn
 get_pasal = server.get_pasal.fn
+get_lampiran = server.get_lampiran.fn
 get_law_status = server.get_law_status.fn
 get_law_context = server.get_law_context.fn
 list_laws = server.list_laws.fn
@@ -51,6 +52,7 @@ def _reset():
     server._law_count = None
     server._law_count_ts = 0.0
     server._pasal_cache.clear()
+    server._section_cache.clear()
     server._status_cache.clear()
     server._context_cache.clear()
     for limiter in server._rate_limiters.values():
@@ -533,8 +535,8 @@ class TestGetLawContext:
             {"node_type": "lampiran"},
         ]
         babs = [
-            {"number": "I", "heading": "KETENTUAN UMUM"},
-            {"number": "II", "heading": "DANA ABADI KORBAN"},
+            {"number": "I", "heading": "KETENTUAN UMUM", "path": "bab_I"},
+            {"number": "II", "heading": "DANA ABADI KORBAN", "path": "bab_II"},
         ]
         preamble = [{"content_text": "Menimbang  UU  NOMOR 3 TAHUN 2026   TENTANG PELINDUNGAN SAKSI DAN KORBAN"}]
 
@@ -554,7 +556,7 @@ class TestGetLawContext:
 
     def test_outline_defaults_to_12_summary(self, reg_cache):
         node_types = [{"node_type": "pasal"}]
-        babs = [{"number": str(i), "heading": f"Bab {i}"} for i in range(20)]
+        babs = [{"number": str(i), "heading": f"Bab {i}", "path": "bab_x"} for i in range(20)]
 
         server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
         result = get_law_context("UU", "3", 2026)
@@ -563,6 +565,34 @@ class TestGetLawContext:
         server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
         result_full = get_law_context("UU", "3", 2026, detail="outline")
         assert len(result_full["outline_top"]) == 20
+
+    def test_lampiran_outline_separated(self, reg_cache):
+        node_types = [{"node_type": "pasal"}]
+        babs = [
+            {"number": "I", "heading": "KETENTUAN UMUM", "path": "bab_I"},
+            {"number": "II", "heading": "DANA ABADI KORBAN", "path": "bab_II"},
+            {"number": "I", "heading": "Sctayang Pandaag " + "x" * 200, "path": "lampiran_.bab_I"},
+            {"number": "II", "heading": "Megatren", "path": "lampiran_.bab_II"},
+        ]
+        server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
+        result = get_law_context("UU", "3", 2026)
+        assert result["outline_top"] == ["BAB I — KETENTUAN UMUM", "BAB II — DANA ABADI KORBAN"]
+        first, second = result["outline_lampiran"]
+        assert first.startswith("BAB I — Sctayang Pandaag")
+        assert first.endswith("…")
+        assert len(first) <= 130
+        assert second == "BAB II — Megatren"
+
+    def test_long_heading_truncated_in_outline(self, reg_cache):
+        node_types = [{"node_type": "pasal"}]
+        long_head = "HURUF " + "panjang " * 40
+        babs = [{"number": "I", "heading": long_head, "path": "bab_I"}]
+        server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
+        result = get_law_context("UU", "3", 2026)
+        line = result["outline_top"][0]
+        assert line.startswith("BAB I — HURUF panjang")
+        assert line.endswith("…")
+        assert len(line) <= 130
 
     def test_intro_falls_back_to_first_pasal(self, reg_cache):
         node_types = [{"node_type": "pasal"}]
@@ -584,6 +614,80 @@ class TestGetLawContext:
         result = get_law_context("UU", "3", 2026)
         assert "  " not in result["intro_snippet"]
         assert "Menimbang UU NOMOR 3 TAHUN 2026" == result["intro_snippet"]
+
+
+# ===================================================================
+# get_lampiran
+# ===================================================================
+
+class TestGetLampiran:
+
+    WORK = {
+        "id": 1, "title_id": "UU 59/2024 tentang RPJPN 2025-2045",
+        "frbr_uri": "/akn/id/act/uu/2024/59", "number": "59",
+        "year": 2024, "status": "berlaku", "regulation_type_id": 1,
+    }
+
+    @staticmethod
+    def _router(work, *node_lists):
+        """Router: works first, then document_nodes calls in order."""
+        calls = iter(node_lists)
+
+        def router(name):
+            if name == "works":
+                return _qm(data=[work])
+            if name == "document_nodes":
+                try:
+                    return _qm(data=next(calls))
+                except StopIteration:
+                    return _qm(data=[])
+            return _qm()
+        return router
+
+    def test_returns_all_annex_chapters(self, reg_cache):
+        server.sb.table.side_effect = self._router(
+            self.WORK,
+            [{"id": 100}],
+            [
+                {"node_type": "bab", "number": "I", "heading": "Refleksi", "content_text": "Teks bab I " * 900},
+                {"node_type": "bab", "number": "II", "heading": "Megatren", "content_text": "Teks bab II"},
+            ],
+        )
+        result = get_lampiran("UU", "59", 2024)
+        assert result["has_lampiran"] is True
+        assert len(result["sections"]) == 2
+        assert result["sections"][0]["number"] == "I"
+        assert result["truncated"] is True
+        assert result["sections"][0]["content_text"].endswith("[...truncated...]")
+        assert result["total_chars"] > 0
+        assert "disclaimer" in result
+
+    def test_specific_bab(self, reg_cache):
+        server.sb.table.side_effect = self._router(
+            self.WORK,
+            [{"id": 100}],
+            [{"node_type": "bab", "number": "II", "heading": "Megatren", "content_text": "Teks bab II"}],
+        )
+        result = get_lampiran("UU", "59", 2024, bab_number="ii")
+        assert len(result["sections"]) == 1
+        assert result["sections"][0]["number"] == "II"
+        assert result["sections"][0]["content_text"] == "Teks bab II"
+
+    def test_no_lampiran_returns_error(self, reg_cache):
+        server.sb.table.side_effect = self._router(self.WORK, [])
+        result = get_lampiran("UU", "3", 2026)
+        assert "error" in result
+        assert "lampiran" in result["error"].lower()
+
+    def test_unknown_bab_returns_error(self, reg_cache):
+        server.sb.table.side_effect = self._router(
+            self.WORK,
+            [{"id": 100}],
+            [],
+        )
+        result = get_lampiran("UU", "59", 2024, bab_number="X")
+        assert "error" in result
+        assert "X" in result["error"]
 
 
 # ===================================================================
