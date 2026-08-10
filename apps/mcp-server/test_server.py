@@ -325,6 +325,74 @@ class TestGetPasal:
         result = get_pasal("UU", "1", 2020, "5")
         assert [a["number"] for a in result["ayat"]] == ["2", "1", "3"]
 
+    def _work_and_node(self, number):
+        work = {
+            "id": 1, "title_id": "T", "frbr_uri": "/a", "number": "3",
+            "year": 2026, "status": "berlaku", "regulation_type_id": 1,
+            "source_url": "",
+        }
+        node = {
+            "id": 10, "content_text": f"Isi pasal {number}",
+            "parent_id": None, "number": number, "node_type": "pasal",
+        }
+        return work, node
+
+    def test_roman_alias_resolves_first_pasal(self, reg_cache):
+        """Requesting '1' finds the article stored as 'I' (OCR artifact)."""
+        work, node = self._work_and_node("I")
+
+        server.sb.table.side_effect = self._make_router(work, [
+            _qm(data=[]),                                   # exact "1" → miss
+            _qm(data=[{"number": "I"}, {"number": "2"}]),   # available_pasals
+            _qm(data=[node]),                               # alias "I" → hit
+            _qm(data=[]),                                   # ayat children
+        ])
+
+        result = get_pasal("UU", "3", 2026, "1")
+        assert result["pasal_number"] == "I"
+        assert result["content_id"] == "Isi pasal I"
+
+    def test_exact_match_preferred_over_alias(self, reg_cache):
+        """When '1' exists, no alias query is attempted."""
+        work, node = self._work_and_node("1")
+
+        server.sb.table.side_effect = self._make_router(work, [
+            _qm(data=[node]),                               # exact "1" → hit
+            _qm(data=[]),                                   # ayat children
+        ])
+
+        result = get_pasal("UU", "3", 2026, "1")
+        assert result["pasal_number"] == "1"
+        assert result["content_id"] == "Isi pasal 1"
+
+    def test_roman_alias_absent_returns_not_found(self, reg_cache):
+        """No alias in available_pasals → original not-found error preserved."""
+        work, _ = self._work_and_node("I")
+
+        server.sb.table.side_effect = self._make_router(work, [
+            _qm(data=[]),                                   # exact "2" → miss
+            _qm(data=[{"number": "I"}, {"number": "3"}]),   # available_pasals (no "II")
+        ])
+
+        result = get_pasal("UU", "3", 2026, "2")
+        assert "error" in result
+        assert result["available_pasals"] == ["I", "3"]
+
+    def test_arabic_alias_for_roman_request(self, reg_cache):
+        """Requesting 'I' finds the article stored as '1'."""
+        work, node = self._work_and_node("1")
+
+        server.sb.table.side_effect = self._make_router(work, [
+            _qm(data=[]),                                   # exact "I" → miss
+            _qm(data=[{"number": "1"}, {"number": "2"}]),   # available_pasals
+            _qm(data=[node]),                               # alias "1" → hit
+            _qm(data=[]),                                   # ayat children
+        ])
+
+        result = get_pasal("UU", "3", 2026, "I")
+        assert result["pasal_number"] == "1"
+        assert result["content_id"] == "Isi pasal 1"
+
 
 # ===================================================================
 # get_law_status

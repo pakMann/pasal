@@ -314,6 +314,29 @@ def _get_available_pasals(work_id: int) -> list[str]:
     return [r["number"] for r in (result.data or [])]
 
 
+_ROMAN_PASAL = {
+    "1": "I", "2": "II", "3": "III", "4": "IV", "5": "V", "6": "VI",
+    "7": "VII", "8": "VIII", "9": "IX", "10": "X", "11": "XI", "12": "XII",
+}
+
+
+def _pasal_alias(number: str) -> str | None:
+    """Return the Roman/Arabic counterpart of a pasal number, if any.
+
+    Some digitized regulations label the first article as "I" instead of "1"
+    (an OCR artifact of "1." being read as "I."). Return the alternate spelling
+    so callers can retry an exact-match miss. Exact matches always win — the
+    alias only kicks in when the requested spelling is absent.
+    """
+    num = number.strip()
+    if num in _ROMAN_PASAL:
+        return _ROMAN_PASAL[num]
+    for arabic, roman in _ROMAN_PASAL.items():
+        if num.upper() == roman:
+            return arabic
+    return None
+
+
 def _get_intro_snippet(work_id: int, max_chars: int = 600) -> str:
     """Return the opening text of a regulation (preamble/konsiderans or first pasal).
 
@@ -627,10 +650,26 @@ def get_pasal(
         }).execute()
 
         if not node_result.data:
+            available = _get_available_pasals(work["id"])
+            alias = _pasal_alias(pasal_number)
+            if alias and alias in available:
+                node_result = sb.table("document_nodes").select("*").match({
+                    "work_id": work["id"],
+                    "node_type": "pasal",
+                    "number": alias,
+                }).execute()
+                stored_number = node_result.data[0]["number"] if node_result.data else alias
+            else:
+                stored_number = None
+        else:
+            available = []
+            stored_number = pasal_number
+
+        if not node_result.data:
             return _with_disclaimer({
                 "error": f"Pasal {pasal_number} not found in {law_type} {law_number}/{year}",
                 "suggestion": "Check available_pasals below, or use search_laws to find the right article.",
-                "available_pasals": _get_available_pasals(work["id"]),
+                "available_pasals": available if available else _get_available_pasals(work["id"]),
             })
 
         node = node_result.data[0]
@@ -653,11 +692,11 @@ def get_pasal(
                 f"This article has {len(ayat_data)} ayat.]"
             )
 
-        logger.info("get_pasal: found pasal %s (%.0fms)", pasal_number, (time.time() - t0) * 1000)
+        logger.info("get_pasal: found pasal %s (%.0fms)", stored_number or pasal_number, (time.time() - t0) * 1000)
         result = _with_disclaimer({
             "law_title": work["title_id"],
             "frbr_uri": work["frbr_uri"],
-            "pasal_number": pasal_number,
+            "pasal_number": stored_number or pasal_number,
             "chapter": chapter_info,
             "content_id": content,
             "ayat": [{"number": a["number"], "text": a["content_text"]} for a in ayat_data],
