@@ -1,7 +1,8 @@
 """Pasal.id MCP Server — Indonesian Legal Database (v0.3).
 
-Provides Claude with grounded access to Indonesian legislation through 4 tools:
+Provides Claude with grounded access to Indonesian legislation through 5 tools:
 - search_laws: Full-text search across Indonesian legal provisions
+- search_laws_semantic: Hybrid (semantic + FTS) search for natural-language questions
 - get_pasal: Get exact text of a specific article
 - get_law_status: Check if a law is still in force
 - list_laws: Browse available regulations
@@ -15,6 +16,8 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from supabase import create_client
+
+import semantic
 
 load_dotenv()
 
@@ -55,9 +58,11 @@ mcp = FastMCP(
         "KEPMEN (Ministerial Decision) → SE (Circular Letter)\n\n"
         "WORKFLOW — Follow this order for best results:\n"
         "1. search_laws → Find relevant provisions by topic keyword\n"
-        "2. get_pasal → Get exact article text for citation\n"
-        "3. get_law_status → Verify the law is still in force before citing\n"
-        "4. list_laws → Browse available regulations if search is too narrow\n\n"
+        "2. search_laws_semantic → For natural-language case questions (\"saya "
+        "dipecat tanpa pesangon\"), when keyword search misses\n"
+        "3. get_pasal → Get exact article text for citation\n"
+        "4. get_law_status → Verify the law is still in force before citing\n"
+        "5. list_laws → Browse available regulations if search is too narrow\n\n"
         "CITATION FORMAT: Always cite as 'Pasal X UU No. Y Tahun Z'\n"
         "Example: 'Pasal 81 UU No. 13 Tahun 2003 tentang Ketenagakerjaan'\n\n"
         "SEARCH TIPS:\n"
@@ -236,6 +241,7 @@ class RateLimiter:
 
 _rate_limiters = {
     "search_laws": RateLimiter(30),
+    "search_laws_semantic": RateLimiter(30),
     "get_pasal": RateLimiter(60),
     "get_law_status": RateLimiter(60),
     "list_laws": RateLimiter(30),
@@ -303,6 +309,52 @@ def _get_available_pasals(work_id: int) -> list[str]:
         "node_type": "pasal",
     }).order("sort_order").limit(200).execute()
     return [r["number"] for r in (result.data or [])]
+
+
+def _enrich_search_results(raw_rows: list[dict], limit: int,
+                           year_from: int | None, year_to: int | None) -> list[dict]:
+    """Attach law metadata to raw search RPC rows (shared by search_laws and
+    search_laws_semantic). Applies client-side year filtering and dedupes.
+    """
+    work_ids = list(set(r["work_id"] for r in raw_rows))
+    try:
+        works_result = sb.table("works").select(
+            "id, frbr_uri, title_id, number, year, status, regulation_type_id"
+        ).in_("id", work_ids).execute()
+        works_map = {w["id"]: w for w in works_result.data}
+    except Exception as e:
+        logger.error("search metadata fetch failed: %s", e)
+        return []
+
+    _ensure_reg_types()
+
+    enriched = []
+    for r in raw_rows:
+        work = works_map.get(r["work_id"])
+        if not work:
+            continue
+
+        if year_from and work["year"] < year_from:
+            continue
+        if year_to and work["year"] > year_to:
+            continue
+
+        reg_code = _reg_types_by_id.get(work["regulation_type_id"], "")
+        meta = r.get("metadata", {})
+
+        enriched.append({
+            "law_title": work["title_id"],
+            "frbr_uri": work["frbr_uri"],
+            "regulation_type": reg_code,
+            "year": work["year"],
+            "pasal": f"Pasal {meta.get('pasal', '?')}",
+            "snippet": r.get("snippet", r["content"][:300]),
+            "status": work["status"],
+            "relevance_score": round(r["score"], 4),
+        })
+        if len(enriched) >= limit:
+            break
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -374,50 +426,126 @@ def search_laws(
             "suggestion": "Try simpler keywords or remove filters",
         }])
 
-    try:
-        work_ids = list(set(r["work_id"] for r in result.data))
-        works_result = sb.table("works").select(
-            "id, frbr_uri, title_id, number, year, status, regulation_type_id"
-        ).in_("id", work_ids).execute()
-        works_map = {w["id"]: w for w in works_result.data}
-    except Exception as e:
-        logger.error("search_laws metadata fetch failed: %s", e)
-        return _with_disclaimer([{"error": "Failed to fetch law metadata. Please try again later."}])
+    enriched = _enrich_search_results(result.data, limit, year_from, year_to)
 
-    _ensure_reg_types()
-
-    enriched = []
-    for r in result.data:
-        work = works_map.get(r["work_id"])
-        if not work:
-            continue
-
-        # Apply year filter
-        if year_from and work["year"] < year_from:
-            continue
-        if year_to and work["year"] > year_to:
-            continue
-
-        reg_code = _reg_types_by_id.get(work["regulation_type_id"], "")
-        meta = r.get("metadata", {})
-
-        enriched.append({
-            "law_title": work["title_id"],
-            "frbr_uri": work["frbr_uri"],
-            "regulation_type": reg_code,
-            "year": work["year"],
-            "pasal": f"Pasal {meta.get('pasal', '?')}",
-            "snippet": r.get("snippet", r["content"][:300]),
-            "status": work["status"],
-            "relevance_score": round(r["score"], 4),
-        })
-
-        if len(enriched) >= limit:
-            break
+    if not enriched:
+        logger.info("search_laws: no results for %r (%.0fms)", query, (time.time() - t0) * 1000)
+        return _with_disclaimer([{
+            "message": _no_results_message(f"'{query}'"),
+            "suggestion": "Try simpler keywords or remove filters",
+        }])
 
     logger.info("search_laws: %d results for %r (%.0fms)",
                 len(enriched), query, (time.time() - t0) * 1000)
     return _with_disclaimer(enriched)
+
+
+@mcp.tool
+def search_laws_semantic(
+    query: str,
+    regulation_type: str | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    mode: str = "hybrid",
+    limit: int = 10,
+) -> list[dict]:
+    """Search laws by MEANING, not just keywords — good for natural-language case questions.
+
+    USE WHEN: The query describes a real-world situation, fact pattern, or
+    paraphrase rather than exact legal wording, e.g. "saya dipecat tanpa pesangon
+    dan tanpa peringatan tertulis" or "bos menahan ijazah saya setelah saya
+    berhenti bekerja". search_laws (keyword/FTS) may miss these because the words
+    differ from the statutory text.
+    PREFER search_laws (keyword) when you need a specific article by number,
+    topic keyword, or exact legal term — semantic search is slower (embeds the
+    query) and is a complement, not a replacement.
+    DO NEXT: get_pasal to pull the exact article text for citation, then
+    get_law_status to verify it is still in force.
+
+    Combines semantic (vector) ranking with the existing full-text search via
+    Reciprocal Rank Fusion. The vector model (BGE-M3) must match the one used
+    to embed the database; if it is unavailable on this server, the tool
+    degrades to full-text-only behavior automatically.
+
+    Args:
+        query: A question or situation description in Indonesian (natural language is fine)
+        regulation_type: Filter by type code — UU, PP, PERPRES, PERMEN, PERPPU, KEPPRES, INPRES, PENPRES, PERBAN, PERMENKUMHAM, PERMENKUM, PERDA, PERDA_PROV, PERDA_KAB, KEPMEN, SE, TAP_MPR, PERMA, PBI, UUDRT, UUDS
+        year_from: Only return laws enacted after this year
+        year_to: Only return laws enacted before this year
+        mode: Search strategy — "hybrid" (FTS + semantic, default), "fts_only" (exact legacy FTS behavior), or "vector_only"
+        limit: Maximum number of results (default 10)
+    """
+    rate_err = _check_rate_limit("search_laws_semantic")
+    if rate_err:
+        return [rate_err]
+
+    t0 = time.time()
+    logger.info("search_laws_semantic called: query=%r type=%s mode=%s limit=%s",
+                query, regulation_type, mode, limit)
+
+    if not query or not query.strip():
+        return _with_disclaimer(
+            [{"error": "Query cannot be empty", "suggestion": "Provide a search term in Indonesian"}]
+        )
+
+    limit = min(limit, 50)
+    if mode not in ("hybrid", "fts_only", "vector_only"):
+        logger.warning("search_laws_semantic: invalid mode %r, defaulting to hybrid", mode)
+        mode = "hybrid"
+
+    metadata_filter: dict = {}
+    if regulation_type:
+        metadata_filter["type"] = regulation_type.upper()
+
+    query_embedding = None
+    if mode in ("hybrid", "vector_only"):
+        query_embedding = semantic.embed_query(query.strip())
+        if query_embedding is None and mode == "vector_only":
+            return _with_disclaimer([{
+                "error": "Embedding model unavailable on this server",
+                "suggestion": "Use search_laws (keyword) or set mode='fts_only'",
+            }])
+
+    rpc_payload: dict = {
+        "query_text": query.strip(),
+        "match_count": limit * 3,  # fetch extra to filter
+        "metadata_filter": metadata_filter,
+        "mode": mode,
+    }
+    if query_embedding is not None:
+        rpc_payload["query_embedding"] = _vector_literal(query_embedding)
+
+    try:
+        result = sb.rpc("search_hybrid", rpc_payload).execute()
+    except Exception as e:
+        logger.error("search_laws_semantic RPC failed: %s", e)
+        return _with_disclaimer([{"error": "Search failed. Please try again later."}])
+
+    if not result.data:
+        logger.info("search_laws_semantic: no results for %r (%.0fms)",
+                    query, (time.time() - t0) * 1000)
+        return _with_disclaimer([{
+            "message": _no_results_message(f"'{query}'"),
+            "suggestion": "Try simpler keywords or remove filters",
+        }])
+
+    enriched = _enrich_search_results(result.data, limit, year_from, year_to)
+    if not enriched:
+        logger.info("search_laws_semantic: no results for %r (%.0fms)",
+                    query, (time.time() - t0) * 1000)
+        return _with_disclaimer([{
+            "message": _no_results_message(f"'{query}'"),
+            "suggestion": "Try simpler keywords or remove filters",
+        }])
+
+    logger.info("search_laws_semantic: %d results for %r (%.0fms, mode=%s)",
+                len(enriched), query, (time.time() - t0) * 1000, mode)
+    return _with_disclaimer(enriched)
+
+
+def _vector_literal(vec: list[float]) -> str:
+    """Serialize a query vector for the search_hybrid RPC text parameter."""
+    return "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
 
 
 @mcp.tool

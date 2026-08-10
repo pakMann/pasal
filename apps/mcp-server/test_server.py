@@ -135,6 +135,105 @@ class TestSearchLaws:
 
 
 # ===================================================================
+# search_laws_semantic
+# ===================================================================
+
+class TestSearchLawsSemantic:
+
+    def _search(self, *args, **kwargs):
+        return server.search_laws_semantic.fn(*args, **kwargs)
+
+    def test_empty_query_returns_error(self):
+        result = self._search("")
+        assert len(result) == 1
+        assert "error" in result[0]
+
+    def test_whitespace_query_returns_error(self):
+        result = self._search("   ")
+        assert len(result) == 1
+        assert "error" in result[0]
+
+    def test_hybrid_calls_rpc_with_embedding(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query", return_value=[0.1, 0.2, 0.3]):
+            self._search("saya dipecat tanpa pesangon")
+
+        name, payload = server.sb.rpc.call_args[0]
+        assert name == "search_hybrid"
+        assert payload["mode"] == "hybrid"
+        assert payload["query_embedding"].startswith("[")
+        assert "0.100000" in payload["query_embedding"]
+
+    def test_fts_only_skips_embedding(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query") as mock_embed:
+            self._search("upah minimum", mode="fts_only")
+
+        mock_embed.assert_not_called()
+        name, payload = server.sb.rpc.call_args[0]
+        assert name == "search_hybrid"
+        assert payload["mode"] == "fts_only"
+        assert "query_embedding" not in payload
+
+    def test_invalid_mode_defaults_to_hybrid(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query", return_value=[0.1]):
+            self._search("halo", mode="bogus")
+
+        name, payload = server.sb.rpc.call_args[0]
+        assert payload["mode"] == "hybrid"
+
+    def test_vector_only_without_model_returns_error(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query", return_value=None):
+            result = self._search("halo", mode="vector_only")
+
+        assert len(result) == 1
+        assert "error" in result[0]
+        server.sb.rpc.assert_not_called()
+
+    def test_hybrid_degrades_when_model_unavailable(self, reg_cache):
+        # embed_query None in hybrid mode → call RPC in fts_only-ish hybrid
+        # (search_hybrid degrades internally when query_embedding is NULL)
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query", return_value=None):
+            result = self._search("halo")
+
+        assert "error" not in result[0]
+        name, payload = server.sb.rpc.call_args[0]
+        assert name == "search_hybrid"
+        assert "query_embedding" not in payload
+
+    def test_results_enriched_with_expected_keys(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[
+            {"work_id": 1, "content": "text", "score": 0.7,
+             "metadata": {"pasal": "5"}},
+        ])
+        works_mock = _qm(data=[
+            {"id": 1, "frbr_uri": "/akn/id/act/uu/2003/13",
+             "title_id": "UU Ketenagakerjaan", "number": "13",
+             "year": 2003, "status": "berlaku", "regulation_type_id": 1},
+        ])
+        server.sb.table.side_effect = lambda n: works_mock if n == "works" else _qm()
+
+        with patch("server.semantic.embed_query", return_value=[0.1]):
+            result = self._search("pesangon")
+
+        assert len(result) == 1
+        for key in ("law_title", "frbr_uri", "regulation_type",
+                     "pasal", "status", "relevance_score"):
+            assert key in result[0], f"Missing key: {key}"
+
+    def test_limit_capped_at_50(self, reg_cache):
+        server.sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+        with patch("server.semantic.embed_query", return_value=[0.1]):
+            self._search("halo", limit=100)
+
+        name, payload = server.sb.rpc.call_args[0]
+        assert payload["match_count"] == 50 * 3
+
+
+# ===================================================================
 # get_pasal
 # ===================================================================
 

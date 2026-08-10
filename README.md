@@ -159,9 +159,18 @@ This isn't a weekend hack. Key engineering decisions:
 | Tool | Description |
 |------|-------------|
 | `search_laws` | Full-text keyword search across all legal provisions with Indonesian stemming |
+| `search_laws_semantic` | Hybrid (semantic + FTS) search for natural-language case questions; modes `hybrid`/`fts_only`/`vector_only` |
 | `get_pasal` | Get the exact text of a specific article (Pasal) by law and number |
 | `get_law_status` | Check if a law is in force, amended, or revoked with full amendment chain |
 | `list_laws` | Browse available regulations with type, year, and status filters |
+
+Example — semantic search for a natural-language case question:
+
+```
+search_laws_semantic(query="saya dipecat tanpa pesangon dan tanpa peringatan tertulis", mode="hybrid")
+```
+
+Returns provision-level results with `law_title`, `pasal`, `snippet`, and `relevance_score` — the same output shape as `search_laws`, ready to feed `get_pasal`/`get_law_status`. `mode` accepts `hybrid` (default), `fts_only` (exact legacy FTS behavior), or `vector_only`. Requires the optional `requirements-semantic.txt` deps (BGE-M3); without them it degrades to FTS.
 
 ## Tech Stack
 

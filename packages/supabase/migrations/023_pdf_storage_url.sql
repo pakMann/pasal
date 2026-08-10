@@ -7,6 +7,15 @@ VALUES ('regulation-pdfs', 'regulation-pdfs', true)
 ON CONFLICT (id) DO NOTHING;
 
 -- Public read policy for regulation PDFs
-CREATE POLICY IF NOT EXISTS "Public read regulation PDFs"
-  ON storage.objects FOR SELECT
-  USING (bucket_id = 'regulation-pdfs');
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'storage' AND tablename = 'objects'
+      AND policyname = 'Public read regulation PDFs'
+  ) THEN
+    CREATE POLICY "Public read regulation PDFs"
+      ON storage.objects FOR SELECT
+      USING (bucket_id = 'regulation-pdfs');
+  END IF;
+END $$;

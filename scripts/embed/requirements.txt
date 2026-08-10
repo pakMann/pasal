@@ -1,0 +1,10 @@
+# Dependencies for the BGE-M3 embedding pipeline (scripts/embed/).
+# Kept separate from scripts/requirements.txt so crawler deps stay lean.
+# Install with: .venv/bin/pip install -r scripts/embed/requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2,<3
+numpy>=1.26
+FlagEmbedding>=1.3.3
+tqdm>=4.66
+python-dotenv>=1.0
+psycopg[binary]>=3.1

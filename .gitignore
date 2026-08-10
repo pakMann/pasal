@@ -27,6 +27,9 @@ supabase/.temp/
 .cursor/
 .vercel
 
+# Generated analysis output (graphify skill)
+graphify-out/
+
 # OS
 .DS_Store
 Thumbs.db

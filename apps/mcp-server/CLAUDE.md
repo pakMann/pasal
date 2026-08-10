@@ -17,6 +17,7 @@ Requires: `SUPABASE_URL` + `SUPABASE_ANON_KEY` in `.env`.
 | Tool | Rate limit | Cache TTL | Purpose |
 |------|-----------|-----------|---------|
 | `search_laws(query, regulation_type?, year_from?, year_to?, language?, limit?)` | 30/min | None | Full-text search via `search_legal_chunks()` RPC |
+| `search_laws_semantic(query, regulation_type?, year_from?, year_to?, mode?, limit?)` | 30/min | None | Hybrid (semantic+FTS) search via `search_hybrid()` RPC; `mode` = `hybrid`/`fts_only`/`vector_only` |
 | `get_pasal(law_type, law_number, year, pasal_number)` | 60/min | 1h | Exact article text with ayat and cross-references |
 | `get_law_status(law_type, law_number, year)` | 60/min | 1h | Law validity + amendment/revocation chain |
 | `list_laws(regulation_type?, year?, status?, search?, page?, per_page?)` | 30/min | None | Browse/filter regulations |
@@ -34,13 +35,21 @@ Requires: `SUPABASE_URL` + `SUPABASE_ANON_KEY` in `.env`.
 
 ```
 server.py          — All tools, caching, rate limiting, cross-reference extraction
+semantic.py        — Lazy BGE-M3 query embedding for search_laws_semantic (optional deps)
 test_server.py     — Pytest suite with mocked Supabase client
 Dockerfile         — python:3.12-slim, runs server.py
 requirements.txt   — fastmcp, supabase, python-dotenv
+requirements-semantic.txt — optional torch + FlagEmbedding for search_laws_semantic
 railway.json       — Railway deployment config
 ```
 
-Single-file server. All five tools, the `TTLCache`, `RateLimiter`, regulation type cache, and cross-reference regex are in `server.py`.
+Single-file server plus the optional `semantic.py` helper. All five-plus tools, the `TTLCache`, `RateLimiter`, regulation type cache, and cross-reference regex are in `server.py`.
+
+### Semantic search (`search_laws_semantic`)
+
+- Calls the `search_hybrid()` SQL RPC (migration 058): RRF fusion of `search_legal_chunks()` (full 3-layer FTS) and `search_vector_chunks()` (pgvector cosine).
+- Query embedding comes from `semantic.py` (BGE-M3, lazy-loaded on first call). If the model is unavailable the tool degrades to FTS and never errors out on `hybrid` mode.
+- The embedding model must match `scripts/embed/` (`EMBEDDING_MODEL` env, default `BAAI/bge-m3`) so query and document vectors share a space.
 
 ### Key internals
 
