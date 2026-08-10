@@ -649,16 +649,19 @@ class TestGetLampiran:
             self.WORK,
             [{"id": 100}],
             [
+                {"node_type": "preamble", "number": "", "heading": "", "content_text": "UNDANG-UNDANG REPUBLIK INDONESIA NOMOR 59 TAHUN 2024"},
                 {"node_type": "bab", "number": "I", "heading": "Refleksi", "content_text": "Teks bab I " * 900},
                 {"node_type": "bab", "number": "II", "heading": "Megatren", "content_text": "Teks bab II"},
             ],
         )
         result = get_lampiran("UU", "59", 2024)
         assert result["has_lampiran"] is True
-        assert len(result["sections"]) == 2
-        assert result["sections"][0]["number"] == "I"
+        assert len(result["sections"]) == 3
+        assert result["sections"][0]["kind"] == "lampiran_preamble"
+        assert result["sections"][1]["kind"] == "lampiran_bab"
+        assert result["sections"][1]["number"] == "I"
         assert result["truncated"] is True
-        assert result["sections"][0]["content_text"].endswith("[...truncated...]")
+        assert result["sections"][1]["content_text"].endswith("[...truncated...]")
         assert result["total_chars"] > 0
         assert "disclaimer" in result
 

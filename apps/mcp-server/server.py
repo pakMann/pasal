@@ -1011,7 +1011,7 @@ def get_lampiran(
                 text = text[:4000].rstrip() + "\n\n[...truncated...]"
                 truncated = True
             sections.append({
-                "kind": n.get("node_type") or "lampiran",
+                "kind": f"lampiran_{n.get('node_type') or 'node'}",
                 "number": n.get("number") or "",
                 "heading": re.sub(r"\s+", " ", (n.get("heading") or "")).strip(),
                 "content_text": text,
