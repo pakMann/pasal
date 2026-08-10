@@ -1,10 +1,11 @@
 """Pasal.id MCP Server — Indonesian Legal Database (v0.3).
 
-Provides Claude with grounded access to Indonesian legislation through 5 tools:
+Provides Claude with grounded access to Indonesian legislation through 6 tools:
 - search_laws: Full-text search across Indonesian legal provisions
 - search_laws_semantic: Hybrid (semantic + FTS) search for natural-language questions
 - get_pasal: Get exact text of a specific article
 - get_law_status: Check if a law is still in force
+- get_law_context: Get a law's structure, outline, and opening text (for summaries)
 - list_laws: Browse available regulations
 """
 import logging
@@ -209,6 +210,7 @@ class TTLCache:
 
 _pasal_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
 _status_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
+_context_cache = TTLCache(ttl_seconds=3600, maxsize=2000)
 _law_count_cache = TTLCache(ttl_seconds=300, maxsize=10)
 
 
@@ -244,6 +246,7 @@ _rate_limiters = {
     "search_laws_semantic": RateLimiter(30),
     "get_pasal": RateLimiter(60),
     "get_law_status": RateLimiter(60),
+    "get_law_context": RateLimiter(60),
     "list_laws": RateLimiter(30),
 }
 
@@ -309,6 +312,32 @@ def _get_available_pasals(work_id: int) -> list[str]:
         "node_type": "pasal",
     }).order("sort_order").limit(200).execute()
     return [r["number"] for r in (result.data or [])]
+
+
+def _get_intro_snippet(work_id: int, max_chars: int = 600) -> str:
+    """Return the opening text of a regulation (preamble/konsiderans or first pasal).
+
+    Gives an LLM real material to summarize a law's subject matter without
+    fetching every article.
+    """
+    preamble = sb.table("document_nodes").select("content_text").match({
+        "work_id": work_id,
+        "node_type": "preamble",
+    }).limit(1).execute()
+    text = ""
+    for row in preamble.data or []:
+        text = row.get("content_text") or ""
+        break
+    if not text:
+        first = sb.table("document_nodes").select("content_text").match({
+            "work_id": work_id,
+            "node_type": "pasal",
+        }).order("sort_order").limit(1).execute()
+        for row in first.data or []:
+            text = row.get("content_text") or ""
+            break
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
 
 
 def _enrich_search_results(raw_rows: list[dict], limit: int,
@@ -742,6 +771,97 @@ def get_law_status(
     except Exception as e:
         logger.error("get_law_status failed: %s", e)
         return _with_disclaimer({"error": "Failed to retrieve law status. Please try again later."})
+
+
+@mcp.tool
+def get_law_context(
+    law_type: str,
+    law_number: str,
+    year: int,
+    detail: str = "summary",
+) -> dict:
+    """Get the structural context of a regulation: structure counts, chapter outline, and opening text.
+
+    USE WHEN: The user asks what a law is about ("UU 3/2026 tentang apa?"), asks for a
+    summary/ringkasan, or wants to see the law's structure (bab) and subject matter.
+    Returns real material (outline + opening text) so an LLM can summarize the law's
+    contents instead of only citing its title and status.
+
+    Args:
+        law_type: Regulation type code, e.g., "UU", "PP", "PERPRES"
+        law_number: The number of the law, e.g., "13"
+        year: Year the law was enacted, e.g., 2003
+        detail: "summary" (default) or "outline" (include more of the chapter outline)
+    """
+    rate_err = _check_rate_limit("get_law_context")
+    if rate_err:
+        return rate_err
+
+    cache_key = f"{law_type.upper()}:{law_number}:{year}:{detail}"
+    cached = _context_cache.get(cache_key)
+    if cached is not None:
+        logger.info("get_law_context cache hit: %s", cache_key)
+        return cached
+
+    t0 = time.time()
+    logger.info("get_law_context called: %s %s/%d (%s)", law_type, law_number, year, detail)
+
+    try:
+        work = _find_work(law_type, law_number, year)
+        if not work:
+            _ensure_reg_types()
+            if not _reg_types.get(law_type.upper()):
+                return _with_disclaimer({"error": f"Unknown regulation type: {law_type}"})
+            return _with_disclaimer({
+                "error": _no_results_message(f"'{law_type} {law_number}/{year}'"),
+            })
+
+        work_id = work["id"]
+
+        node_result = sb.table("document_nodes").select("node_type").eq(
+            "work_id", work_id
+        ).execute()
+        counts: dict[str, int] = {}
+        for row in node_result.data or []:
+            nt = row["node_type"]
+            counts[nt] = counts.get(nt, 0) + 1
+
+        bab_result = sb.table("document_nodes").select("number, heading").match({
+            "work_id": work_id,
+            "node_type": "bab",
+        }).order("sort_order").limit(30).execute()
+
+        outline_top: list[str] = []
+        for b in bab_result.data or []:
+            num = (b.get("number") or "").strip()
+            head = re.sub(r"\s+", " ", (b.get("heading") or "")).strip()
+            label = f"BAB {num}" if num else "BAB"
+            if head and head.upper() != label:
+                outline_top.append(f"{label} — {head}")
+            else:
+                outline_top.append(label)
+
+        outline_limit = 30 if detail == "outline" else 12
+        result = _with_disclaimer({
+            "law_title": work["title_id"],
+            "frbr_uri": work["frbr_uri"],
+            "status": work["status"],
+            "structure": {
+                "n_bab": counts.get("bab", 0),
+                "n_pasal": counts.get("pasal", 0),
+                "n_ayat": counts.get("ayat", 0),
+                "has_penjelasan": counts.get("penjelasan_pasal", 0) > 0 or counts.get("penjelasan_umum", 0) > 0,
+                "has_lampiran": counts.get("lampiran", 0) > 0,
+            },
+            "outline_top": outline_top[:outline_limit],
+            "intro_snippet": _get_intro_snippet(work_id),
+            "detail": detail,
+        })
+        _context_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        logger.error("get_law_context failed: %s", e)
+        return _with_disclaimer({"error": "Failed to retrieve law context. Please try again later."})
 
 
 @mcp.tool

@@ -20,6 +20,7 @@ Requires: `SUPABASE_URL` + `SUPABASE_ANON_KEY` in `.env`.
 | `search_laws_semantic(query, regulation_type?, year_from?, year_to?, mode?, limit?)` | 30/min | None | Hybrid (semantic+FTS) search via `search_hybrid()` RPC; `mode` = `hybrid`/`fts_only`/`vector_only` |
 | `get_pasal(law_type, law_number, year, pasal_number)` | 60/min | 1h | Exact article text with ayat and cross-references |
 | `get_law_status(law_type, law_number, year)` | 60/min | 1h | Law validity + amendment/revocation chain |
+| `get_law_context(law_type, law_number, year, detail?)` | 60/min | 1h | Law structure (bab/pasal counts), chapter outline, and opening text — feeds LLM summaries |
 | `list_laws(regulation_type?, year?, status?, search?, page?, per_page?)` | 30/min | None | Browse/filter regulations |
 | `ping()` | None | None | Health check with DB law count |
 

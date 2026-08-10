@@ -16,6 +16,7 @@ with patch("supabase.create_client", return_value=MagicMock()):
 search_laws = server.search_laws.fn
 get_pasal = server.get_pasal.fn
 get_law_status = server.get_law_status.fn
+get_law_context = server.get_law_context.fn
 list_laws = server.list_laws.fn
 
 
@@ -51,6 +52,7 @@ def _reset():
     server._law_count_ts = 0.0
     server._pasal_cache.clear()
     server._status_cache.clear()
+    server._context_cache.clear()
     for limiter in server._rate_limiters.values():
         limiter.reset()
     server.sb.reset_mock()
@@ -414,6 +416,106 @@ class TestGetLawStatus:
 
         result = get_law_status("UU", "1", 2020)
         assert result["date_enacted"] == "2020-03-15"
+
+
+# ===================================================================
+# get_law_context
+# ===================================================================
+
+class TestGetLawContext:
+
+    WORK = {
+        "id": 1, "title_id": "UU 3/2026 tentang Pelindungan Saksi dan Korban",
+        "frbr_uri": "/akn/id/act/uu/2026/3", "number": "3",
+        "year": 2026, "status": "berlaku", "regulation_type_id": 1,
+    }
+
+    @staticmethod
+    def _make_router(work, node_calls: list):
+        """Router: works first, then document_nodes calls in order.
+
+        ``node_calls`` is a list of row-lists; the i-th document_nodes query
+        returns the i-th list (node_type counts, bab outline, then one or two
+        intro-snippet lookups).
+        """
+        calls = iter(node_calls)
+
+        def router(name):
+            if name == "works":
+                return _qm(data=[work])
+            if name == "document_nodes":
+                try:
+                    return _qm(data=next(calls))
+                except StopIteration:
+                    return _qm(data=[])
+            return _qm()
+        return router
+
+    def test_unknown_law_type_returns_error(self, reg_cache):
+        result = get_law_context("FAKE", "1", 2003)
+        assert result["error"] == "Unknown regulation type: FAKE"
+
+    def test_structure_and_outline(self, reg_cache):
+        node_types = [
+            {"node_type": "preamble"}, {"node_type": "preamble"},
+            {"node_type": "bab"}, {"node_type": "bab"},
+            {"node_type": "pasal"}, {"node_type": "pasal"},
+            {"node_type": "ayat"}, {"node_type": "ayat"},
+            {"node_type": "penjelasan_pasal"},
+            {"node_type": "lampiran"},
+        ]
+        babs = [
+            {"number": "I", "heading": "KETENTUAN UMUM"},
+            {"number": "II", "heading": "DANA ABADI KORBAN"},
+        ]
+        preamble = [{"content_text": "Menimbang  UU  NOMOR 3 TAHUN 2026   TENTANG PELINDUNGAN SAKSI DAN KORBAN"}]
+
+        server.sb.table.side_effect = self._make_router(
+            self.WORK, [node_types, babs, preamble],
+        )
+
+        result = get_law_context("UU", "3", 2026)
+
+        assert result["structure"]["n_bab"] == 2
+        assert result["structure"]["n_pasal"] == 2
+        assert result["structure"]["has_penjelasan"] is True
+        assert result["structure"]["has_lampiran"] is True
+        assert result["outline_top"] == ["BAB I — KETENTUAN UMUM", "BAB II — DANA ABADI KORBAN"]
+        assert "PELINDUNGAN SAKSI DAN KORBAN" in result["intro_snippet"]
+        assert "disclaimer" in result
+
+    def test_outline_defaults_to_12_summary(self, reg_cache):
+        node_types = [{"node_type": "pasal"}]
+        babs = [{"number": str(i), "heading": f"Bab {i}"} for i in range(20)]
+
+        server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
+        result = get_law_context("UU", "3", 2026)
+        assert len(result["outline_top"]) == 12
+
+        server.sb.table.side_effect = self._make_router(self.WORK, [node_types, babs, []])
+        result_full = get_law_context("UU", "3", 2026, detail="outline")
+        assert len(result_full["outline_top"]) == 20
+
+    def test_intro_falls_back_to_first_pasal(self, reg_cache):
+        node_types = [{"node_type": "pasal"}]
+        first_pasal = [{"content_text": "Pasal 1 Setiap orang berhak atas perlindungan."}]
+
+        server.sb.table.side_effect = self._make_router(
+            self.WORK, [node_types, [], [], first_pasal],
+        )
+
+        result = get_law_context("UU", "3", 2026)
+        assert "Pasal 1" in result["intro_snippet"]
+
+    def test_whitespace_normalized_in_intro(self, reg_cache):
+        node_types = [{"node_type": "pasal"}]
+        preamble = [{"content_text": "Menimbang\n\n  UU  NOMOR   3   TAHUN 2026\n"}]
+
+        server.sb.table.side_effect = self._make_router(self.WORK, [node_types, [], preamble])
+
+        result = get_law_context("UU", "3", 2026)
+        assert "  " not in result["intro_snippet"]
+        assert "Menimbang UU NOMOR 3 TAHUN 2026" == result["intro_snippet"]
 
 
 # ===================================================================
